@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS observations (
     name TEXT PRIMARY KEY,
     signature TEXT NOT NULL,
     since REAL NOT NULL,
-    handled INTEGER NOT NULL DEFAULT 0
+    handled INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retryable INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY,
@@ -56,11 +58,17 @@ class Ledger:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        if version not in (0, 1, 2):
             raise ValueError("unsupported ledger schema; restore matching application image")
         self.db.executescript(SCHEMA)
-        self.db.execute("PRAGMA user_version=1")
-        self.db.commit()
+        with self.db:
+            columns = {row["name"] for row in self.db.execute("PRAGMA table_info(observations)")}
+            for column in ("attempts", "retryable"):
+                if column not in columns:
+                    self.db.execute(
+                        f"ALTER TABLE observations ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    )
+            self.db.execute("PRAGMA user_version=2")
 
     def close(self):
         self.db.close()

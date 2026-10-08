@@ -105,6 +105,23 @@ def main():
                 "files=pathlib.Path('/acceptance/model_cache').rglob('*'); "
                 "[os.chown(p,10001,10001) for p in files]",
             )
+        docker(
+            "run",
+            "--rm",
+            "--user",
+            "10001:10001",
+            "--entrypoint",
+            "python",
+            "-v",
+            f"{volume}:/acceptance",
+            "--mount",
+            f"type=bind,source={Path(__file__).parent.resolve()},target=/tests,readonly",
+            args.image,
+            "-c",
+            "import sys; sys.path.insert(0,'/'); from pathlib import Path; "
+            "from tests.fixtures import legacy_failed_claim; r=Path('/acceptance'); "
+            "legacy_failed_claim(r/'state/jobs.sqlite3',r/'inbox/SYNTHETIC-single.pdf',r/'review')",
+        )
         options = [
             "--name",
             name,
@@ -154,6 +171,10 @@ def main():
         )
         assert sum(row[1] == "completed" for row in rows) == 5, rows
         assert sum(row[1] == "review" for row in rows) == 1, rows
+        assert query(
+            name, "SELECT attempts FROM observations WHERE name='SYNTHETIC-single.pdf'"
+        ) == [[2]]
+        assert query(name, "PRAGMA user_version") == [[2]]
         for source, status, proposal, error in rows:
             if "129" in source:
                 assert status == "review" and "128" in error
@@ -258,6 +279,7 @@ def main():
             "cgroup_resources_after_initial_fixtures": json.loads(resource_stats),
             "fixtures": [(row[0], row[1]) for row in rows],
             "offline_restart": "passed",
+            "existing_v1_failed_input_retried_on_startup": True,
             "consumed_outputs_not_regenerated": True,
             "forced_inference_termination_resumed_attempts": attempts,
             "logs": docker("logs", name),

@@ -277,13 +277,13 @@ def test_unsupported_archive_rename_is_diagnosed_and_retryable(config, ledger, m
     assert not (config.archive / digest / "source.pdf").exists()
     assert ledger.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
     assert not list(config.consume.iterdir())
-    # retry-input removes the observation after the storage configuration is fixed.
-    with ledger.db:
-        ledger.db.execute("DELETE FROM observations WHERE name=?", (source.name,))
+    # Startup retries the same untouched input after the storage configuration is fixed.
+    worker.recover()
     worker.cycle()
     assert ledger.job(digest)["status"] == "completed"
     assert sha256(config.archive / digest / "source.pdf") == digest
     assert not (config.archive / digest / "source.pending").exists()
+    assert not list(config.review.glob("input-*.json"))
 
 
 def test_interrupted_analysis_restarts_before_any_publication(config, ledger):
@@ -299,7 +299,9 @@ def test_interrupted_analysis_restarts_before_any_publication(config, ledger):
 
 def test_interrupted_claim_is_not_silently_lost(config, ledger):
     with ledger.db:
-        ledger.db.execute("INSERT INTO observations VALUES('source.pdf','[]',0,2)")
+        ledger.db.execute(
+            "INSERT INTO observations(name,signature,since,handled) VALUES('source.pdf','[]',0,2)"
+        )
     Worker(config, ledger, None).recover()
     assert len(list(config.review.iterdir())) == 1
 

@@ -158,8 +158,30 @@ an old ledger without reconciling consumer history can duplicate deliveries.
 
 Technical analysis failures have bounded retries/backoff; invalid PDF, password/
 encryption, unsupported size/page count, mutation and structural errors go directly
-to review. Interrupted claims remain explicit review records, not endless rescans.
-An exhausted attempt budget quarantines. Stop the worker before administration:
+to review.
+
+**Restarting automatically retries recoverable inbox claim failures**, including
+storage/permission errors and interrupted copies. The existing PDF stays exactly
+where it is: no deletion, re-upload, rename or `retry-input` command is needed after
+fixing storage. Each restart schedules at most one new claim attempt per failed
+input, subject to the usual settling/marker contract and a durable
+`SPLIT_MAX_ATTEMPTS` budget (default 3 total attempts). Persistent failures do not
+loop on every poll or gain an unlimited budget across restarts. This claim budget
+is separate from the job's analysis attempt counter. A successful claim
+removes its stale input-review record; retry events remain in the ledger.
+
+Already claimed batches, completed outputs, deliberate review/dry-run decisions,
+permanent input failures and ambiguous deliveries are **not** automatically
+reprocessed. Existing schema-v1 `claim I/O failure` review records are recognized
+on upgrade, so scans rejected by older images are retried too. Keep both the state
+and review directories during the upgrade. The ledger migrates to schema 2 in
+place, preserving jobs/hashes/output progress; older schema-1 images cannot open
+the upgraded database. Back up the stopped state directory before upgrading and
+do not restore a stale backup after new deliveries without reconciling them.
+
+An exhausted attempt budget remains in review. `retry-input` is still available
+as an explicit reset after an operator resolves a persistent failure; it never
+requires deleting the PDF. Stop the worker before administration:
 
 ```sh
 doc-splitter check
@@ -196,7 +218,9 @@ uv run python -m tests.container_acceptance
 The last command creates **isolated, uniquely named temporary Docker volumes**,
 downloads the real model, checks German/English OCR, processes 1/4/41/128 pages,
 rejects 129 pages, simulates consumer removal, restarts with `--network none`, and
-kills/restarts the actual worker during inference. It removes only its own test
+kills/restarts the actual worker during inference. It also starts from a schema-v1
+failed inbox claim and verifies automatic migration/retry of the untouched PDF.
+It removes only its own test
 container/volume afterward. Fixtures are explicitly synthetic and non-sensitive.
 
 GitHub Actions runs lint/tests and cold-cache real-container acceptance before

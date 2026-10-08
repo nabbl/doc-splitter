@@ -1,7 +1,12 @@
+import hashlib
+import json
+import sqlite3
 from pathlib import Path
 
 import pikepdf
 from PIL import Image, ImageDraw
+
+from doc_splitter.fs import atomic_json, fingerprint
 
 
 def text_pdf(path: Path, pages: int = 1, label: str = "SYNTHETIC TEST", rotate: bool = False):
@@ -47,3 +52,27 @@ def merged_pdf(path: Path):
     finally:
         first.unlink()
         second.unlink()
+
+
+def legacy_failed_claim(database: Path, source: Path, review: Path):
+    signature = json.dumps(fingerprint(source.stat()))
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE observations (name TEXT PRIMARY KEY, signature TEXT NOT NULL, "
+            "since REAL NOT NULL, handled INTEGER NOT NULL DEFAULT 0)"
+        )
+        connection.execute("INSERT INTO observations VALUES(?,?,0,1)", (source.name, signature))
+        connection.execute("PRAGMA user_version=1")
+    identifier = hashlib.sha256((source.name + signature).encode()).hexdigest()
+    record = review / ("input-" + identifier + ".json")
+    atomic_json(
+        record,
+        {
+            "status": "review",
+            "source_name": source.name,
+            "signature": signature,
+            "reason": "claim I/O failure errno=22; fix storage and retry-input",
+            "original_retained_in_inbox": True,
+        },
+    )
+    return record

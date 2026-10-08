@@ -2,6 +2,7 @@ import errno
 import hashlib
 import json
 import logging
+import os
 import stat
 import time
 import uuid
@@ -13,6 +14,7 @@ from .fs import (
     atomic_json,
     copy_source,
     fingerprint,
+    regular_fd,
     rename_noreplace,
     sha256,
     sync_dir,
@@ -55,6 +57,10 @@ class Worker:
         if sha256(source) != job["source_hash"] or sha256(self.source(job)) != job["source_hash"]:
             raise UnsafeInput("inbox or immutable archive checksum changed")
 
+    def input_review(self, name, signature):
+        identifier = hashlib.sha256((name + signature).encode()).hexdigest()
+        return identifier, self.config.review / ("input-" + identifier + ".json")
+
     def scan(self, now=None):
         now = time.time() if now is None else now
         for path in sorted(self.config.inbox.iterdir()):
@@ -79,7 +85,8 @@ class Worker:
             if observation is None or observation["signature"] != signature:
                 with self.ledger.db:
                     self.ledger.db.execute(
-                        "INSERT OR REPLACE INTO observations VALUES(?,?,?,0)",
+                        "INSERT OR REPLACE INTO observations(name,signature,since,handled) "
+                        "VALUES(?,?,?,0)",
                         (path.name, signature, now),
                     )
                 since = now
@@ -96,10 +103,16 @@ class Worker:
             temporary = self.config.work / ("claim-" + uuid.uuid4().hex + ".pdf")
             with self.ledger.db:
                 self.ledger.db.execute(
-                    "UPDATE observations SET handled=2 WHERE name=? AND signature=?",
+                    "UPDATE observations SET handled=2,attempts=attempts+1,retryable=0 "
+                    "WHERE name=? AND signature=?",
                     (path.name, signature),
                 )
+            attempts = self.ledger.db.execute(
+                "SELECT attempts FROM observations WHERE name=?", (path.name,)
+            ).fetchone()["attempts"]
+            identifier, review_path = self.input_review(path.name, signature)
             operation = "validate_input"
+            claim_committed = False
             try:
                 if not stat.S_ISREG(info.st_mode) or path.is_symlink():
                     raise UnsafeInput("inbox entry is not a regular non-symlink file")
@@ -159,14 +172,24 @@ class Worker:
                         "UPDATE observations SET handled=1 WHERE name=? AND signature=?",
                         (path.name, signature),
                     )
+                    if attempts > 1:
+                        self.ledger.event(identifier, "claim_recovered", digest)
+                claim_committed = True
                 if existing is None:
                     operation = "write_manifest"
                     self.write_manifest(digest)
                     LOG.info("job=%s transition=queued", digest)
                 else:
                     LOG.info("job=%s duplicate_suppressed=true", existing["id"])
+                operation = "resolve_input_review"
+                review_path.unlink(missing_ok=True)
+                sync_dir(self.config.review)
             except (OSError, UnsafeInput) as error:
-                hint = "fix storage and retry-input"
+                retryable = isinstance(error, OSError) and not claim_committed
+                if retryable and attempts < self.config.max_attempts:
+                    hint = "fix storage and restart; startup will retry this input"
+                else:
+                    hint = "fix storage and use retry-input if another attempt is appropriate"
                 if operation == "seal_archive" and getattr(error, "errno", None) in {
                     errno.EINVAL,
                     errno.ENOTSUP,
@@ -174,55 +197,122 @@ class Worker:
                 }:
                     hint = (
                         "check archive exclusive-rename support; use physical local archive "
-                        "storage, then retry-input"
+                        f"storage; {hint}"
                     )
                 reason = (
                     str(error)
                     if isinstance(error, UnsafeInput)
                     else f"claim I/O failure operation={operation} errno={error.errno}; {hint}"
                 )
-                identifier = hashlib.sha256((path.name + signature).encode()).hexdigest()
                 atomic_json(
-                    self.config.review / ("input-" + identifier + ".json"),
+                    review_path,
                     {
                         "status": "review",
                         "source_name": path.name,
                         "signature": signature,
                         "reason": reason,
                         "operation": operation,
+                        "attempts": attempts,
+                        "retryable": retryable,
                         "original_retained_in_inbox": True,
                     },
                 )
                 with self.ledger.db:
                     self.ledger.db.execute(
-                        "UPDATE observations SET handled=1 WHERE name=? AND signature=?",
-                        (path.name, signature),
+                        "UPDATE observations SET handled=1,retryable=? "
+                        "WHERE name=? AND signature=?",
+                        (retryable, path.name, signature),
                     )
+                    self.ledger.event(identifier, "claim_failed", reason)
                 LOG.error("input=%s transition=review reason=%s", identifier, reason)
             finally:
                 temporary.unlink(missing_ok=True)
 
-    def recover(self):
-        interrupted = self.ledger.db.execute(
-            "SELECT * FROM observations WHERE handled=2"
+    def recover_inputs(self):
+        observations = self.ledger.db.execute(
+            "SELECT * FROM observations WHERE handled=2 "
+            "OR (handled=1 AND (attempts=0 OR retryable=1))"
         ).fetchall()
-        for observation in interrupted:
-            identifier = hashlib.sha256(
-                (observation["name"] + observation["signature"]).encode()
-            ).hexdigest()
-            atomic_json(
-                self.config.review / ("input-" + identifier + ".json"),
-                {
-                    "status": "review",
-                    "source_name": observation["name"],
-                    "reason": "claim interrupted; original retained in inbox; use retry-input",
-                },
+        for observation in observations:
+            identifier, review_path = self.input_review(
+                observation["name"], observation["signature"]
             )
+            attempts = max(1, observation["attempts"])
+            retryable = bool(observation["retryable"])
+            if observation["handled"] == 2:
+                retryable = True
+                atomic_json(
+                    review_path,
+                    {
+                        "status": "review",
+                        "source_name": observation["name"],
+                        "signature": observation["signature"],
+                        "reason": "claim interrupted; original retained in inbox",
+                        "attempts": attempts,
+                        "retryable": True,
+                        "original_retained_in_inbox": True,
+                    },
+                )
+                LOG.error("input=%s transition=review reason=interrupted_claim", identifier)
+            elif observation["attempts"] == 0:
+                # Schema v1 used handled=1 for both successful claims and all failures.
+                try:
+                    with os.fdopen(regular_fd(review_path), "r") as stream:
+                        report = json.load(stream)
+                    reason = report.get("reason", "") if isinstance(report, dict) else ""
+                    retryable = (
+                        isinstance(report, dict)
+                        and report.get("status") == "review"
+                        and report.get("source_name") == observation["name"]
+                        and report.get("signature", observation["signature"])
+                        == observation["signature"]
+                        and isinstance(reason, str)
+                        and reason.startswith(("claim I/O failure", "claim interrupted;"))
+                    )
+                except FileNotFoundError:
+                    retryable = False
+                except (OSError, ValueError, UnsafeInput) as error:
+                    LOG.error(
+                        "input=%s legacy_review_unreadable type=%s; retry-input may be required",
+                        identifier,
+                        type(error).__name__,
+                    )
+                    continue
+            accepted = self.ledger.db.execute(
+                "SELECT 1 FROM jobs WHERE source_name=? AND source_signature=? LIMIT 1",
+                (observation["name"], observation["signature"]),
+            ).fetchone()
+            if accepted:
+                retryable = False
+            retry = retryable and attempts < self.config.max_attempts
             with self.ledger.db:
                 self.ledger.db.execute(
-                    "UPDATE observations SET handled=1 WHERE name=?", (observation["name"],)
+                    "UPDATE observations SET handled=?,attempts=?,retryable=?,since=? WHERE name=?",
+                    (
+                        0 if retry else 1,
+                        attempts,
+                        retryable,
+                        time.time() if retry else observation["since"],
+                        observation["name"],
+                    ),
                 )
-            LOG.error("input=%s transition=review reason=interrupted_claim", identifier)
+                if retry:
+                    self.ledger.event(identifier, "startup_retry", f"attempt={attempts + 1}")
+            if retry:
+                LOG.info(
+                    "input=%s transition=startup_retry next_attempt=%s",
+                    identifier,
+                    attempts + 1,
+                )
+            elif retryable:
+                LOG.error(
+                    "input=%s transition=review reason=claim_retry_budget_exhausted attempts=%s",
+                    identifier,
+                    attempts,
+                )
+
+    def recover(self):
+        self.recover_inputs()
         jobs = self.ledger.db.execute(
             "SELECT * FROM jobs WHERE status NOT IN ('completed','review','dry_run')"
         ).fetchall()

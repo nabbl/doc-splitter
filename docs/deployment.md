@@ -71,6 +71,12 @@ budgets are examples (4 GiB/two CPUs), not production capacity measurements.
 
 ## Rollback
 
+The startup-retry release upgrades the ledger to schema 2, preserving existing
+jobs and output progress. Back up state while stopped before upgrading. Older
+schema-1 images cannot open the upgraded ledger; choose a schema-compatible
+rollback image. Never restore a pre-upgrade ledger over newer deliveries without
+reconciling consumer history.
+
 Stop only the preprocessor through Arcane. Revert its GitOps image/config commit
 to the previously verified image (or leave this newly added service stopped).
 Preserve state including SQLite/WAL, originals, review, staging, work and model
