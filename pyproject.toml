@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling==1.28.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "doc-splitter"
+version = "0.1.0"
+description = "Local, durable PDF boundary preprocessing for Paperless"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "numpy==2.2.6",
+  "onnxruntime==1.23.2",
+  "pikepdf==10.0.2",
+  "pillow==12.0.0",
+  "pypdfium2==4.30.0",
+  "tokenizers==0.22.1",
+]
+
+[project.scripts]
+doc-splitter = "doc_splitter.cli:main"
+
+[dependency-groups]
+dev = ["pytest==9.0.2", "ruff==0.14.9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["model: requires a populated real model cache"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
