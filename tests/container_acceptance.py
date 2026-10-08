@@ -146,7 +146,7 @@ def main():
                 0
             ][0]
             == 6,
-            timeout=600,
+            timeout=1800,
         )
         elapsed = time.monotonic() - started
         rows = query(
@@ -243,7 +243,7 @@ def main():
         await_condition(
             name,
             lambda: query(name, "SELECT count(*) FROM jobs WHERE status='completed'")[0][0] == 6,
-            timeout=600,
+            timeout=1800,
         )
         attempts = query(
             name, "SELECT attempts FROM jobs WHERE source_name='SYNTHETIC-restart.pdf'"

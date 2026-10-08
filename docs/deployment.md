@@ -6,8 +6,10 @@ must not be described as live until that verification is complete.
 ## Discovered, not inferred
 
 - Application repository: `https://github.com/nabbl/doc-splitter`.
-- Existing local GitOps repository: `nabbl/gitops-arcane`. Its remote returned
-  `Repository not found` to API/clone/fetch attempts in this session.
+- Existing local GitOps repository: `nabbl/gitops-arcane`. Initial API/clone/fetch
+  attempts used an unrelated injected GitHub identity and failed. Repository
+  access was restored using the owner's existing keyring account scoped to the
+  relevant commands, without switching global authentication.
 - Existing conventions: one project directory with `compose.yaml`, private
   Arcane environment or `.env`, `.env.example`, restart policy, host binds and GHCR
   images. No build workflow existed for this new application; one is provided here.
@@ -19,8 +21,9 @@ must not be described as live until that verification is complete.
   dedicated local handoff topology, Arcane project ID and synced commit are unknown.
   They are deliberately not fabricated.
 
-The existing consume root's parent is unsuitable as a guessed common bind:
-it exposes unrelated media and uses Unraid user-share FUSE semantics.
+The existing consume mapping uses Unraid user-share FUSE semantics. Its correct
+narrow physical backing directory has not been established; do not guess a safe
+parent bind from a shared pathname prefix.
 The application fails closed for FUSE handoff/state. Operator must first identify
 the actual physical local pool/filesystem and explicitly approve a dedicated narrow
 handoff layout. Do not automatically move existing documents or change Paperless.
