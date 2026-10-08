@@ -148,9 +148,15 @@ def verify_layout(config) -> None:
         # Separate bind mounts can return EXDEV even with equal st_dev.
         if containing(config.staging)[1] != containing(config.consume)[1]:
             raise ValueError("staging and consume require ONE common parent bind mount")
-        if containing(config.state)[2] not in {"ext4", "xfs", "btrfs", "zfs", "overlay"}:
+        local_filesystems = {"ext4", "xfs", "btrfs", "zfs", "overlay"}
+        if containing(config.state)[2] not in local_filesystems:
             raise ValueError("state must use a supported local filesystem, not NFS/CIFS/FUSE")
-        if containing(config.consume)[2] not in {"ext4", "xfs", "btrfs", "zfs", "overlay"}:
+        if containing(config.archive)[2] not in local_filesystems:
+            raise ValueError(
+                "archive must use a supported local filesystem for exclusive rename, "
+                "not NFS/CIFS/FUSE"
+            )
+        if containing(config.consume)[2] not in local_filesystems:
             raise ValueError(
                 "handoff requires a local filesystem, not an Unraid user-share/FUSE path"
             )

@@ -43,18 +43,20 @@ def test_host_bind_overlap_rejected(config, monkeypatch):
         verify_layout(config)
 
 
-@pytest.mark.parametrize("root", ["state", "consume"])
+@pytest.mark.parametrize("root", ["state", "archive", "consume"])
 @pytest.mark.parametrize("filesystem", ["nfs", "cifs", "fuse.shfs", "tmpfs"])
 def test_unsupported_filesystems_rejected(config, monkeypatch, root, filesystem):
     rows = ["1 0 0:1 / / rw - ext4 /dev/test rw"]
-    if root == "state":
-        rows.append(f"2 1 0:2 / {config.state} rw - {filesystem} /test rw")
+    if root in {"state", "archive"}:
+        rows.append(f"2 1 0:2 / {getattr(config, root)} rw - {filesystem} /test rw")
     else:
         # The common parent covers both consume and staging.
         rows = [f"1 0 0:1 / / rw - {filesystem} /test rw"]
         rows.append(f"2 1 0:2 / {config.state} rw - ext4 /dev/test rw")
+        rows.append(f"3 1 0:3 / {config.archive} rw - ext4 /dev/archive rw")
     mount_table(monkeypatch, rows)
-    with pytest.raises(ValueError, match="filesystem|FUSE"):
+    label = "handoff requires" if root == "consume" else f"{root} must"
+    with pytest.raises(ValueError, match=label):
         verify_layout(config)
 
 

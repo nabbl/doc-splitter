@@ -72,12 +72,18 @@ variables; the CLI does not implicitly load a `.env` file.
 | `SPLIT_HEARTBEAT_TIMEOUT`, `STARTUP_TIMEOUT` | 60 seconds, 1800 seconds |
 | `SPLIT_IMAGE_REVISION` | Baked from the application Git commit during image build |
 
-`STATE` must be genuinely local durable storage. On Linux, state and handoff accept
+`STATE` and `ARCHIVE` must be genuinely local durable storage. On Linux, state,
+archive and handoff accept
 ext4/xfs/btrfs/zfs/overlay only, not NFS/CIFS/FUSE or tmpfs. **Consume and staging
 must be siblings under ONE narrow parent bind mount**, outside each other's trees.
 Matching `st_dev` alone is insufficient: mount IDs are checked to reject separate
 bind mounts that return `EXDEV`. Runtime uses Linux `renameat2(RENAME_NOREPLACE)`
 (macOS tests use `renamex_np(RENAME_EXCL)`), never overwrite-style fallback.
+The archive also needs this exclusive rename when sealing `source.pending` as
+`source.pdf`, before a job is queued. A user-share archive can therefore fail
+claiming even when state and handoff are on supported storage. Claim failures
+record an operation name (such as `copy_to_work` or `seal_archive`) and errno,
+without logging document text or filenames.
 Only final PDFs enter consume; no probe files, JSON, DBs or staging directories.
 Keep the handoff on durable local storage with atomic rename and fsync semantics.
 

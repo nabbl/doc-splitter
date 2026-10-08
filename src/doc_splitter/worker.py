@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import json
 import logging
@@ -98,23 +99,28 @@ class Worker:
                     "UPDATE observations SET handled=2 WHERE name=? AND signature=?",
                     (path.name, signature),
                 )
+            operation = "validate_input"
             try:
                 if not stat.S_ISREG(info.st_mode) or path.is_symlink():
                     raise UnsafeInput("inbox entry is not a regular non-symlink file")
                 if path.suffix.lower() != ".pdf":
                     raise UnsafeInput("unsupported input extension; only PDF is accepted")
+                operation = "copy_to_work"
                 digest, copied_signature = copy_source(
                     path, temporary, self.config.max_source_mb * 1024 * 1024
                 )
+                operation = "create_archive_directory"
                 folder = self.config.archive / digest
                 folder.mkdir(mode=0o700, exist_ok=True)
                 if folder.is_symlink():
                     raise UnsafeInput("archive directory is a symlink")
                 archived = folder / "source.pdf"
                 if archived.exists():
+                    operation = "verify_archive"
                     if sha256(archived) != digest:
                         raise UnsafeInput("immutable archive checksum mismatch")
                 else:
+                    operation = "copy_to_archive"
                     pending = folder / "source.pending"
                     pending.unlink(missing_ok=True)
                     copied_hash, _ = copy_source(
@@ -122,8 +128,11 @@ class Worker:
                     )
                     if copied_hash != digest:
                         raise UnsafeInput("archive copy checksum mismatch")
+                    operation = "protect_archive"
                     pending.chmod(0o440)
+                    operation = "seal_archive"
                     rename_noreplace(pending, archived)
+                    operation = "sync_archive"
                     sync_dir(self.config.archive)
                 with self.ledger.db:
                     existing = self.ledger.db.execute(
@@ -151,15 +160,26 @@ class Worker:
                         (path.name, signature),
                     )
                 if existing is None:
+                    operation = "write_manifest"
                     self.write_manifest(digest)
                     LOG.info("job=%s transition=queued", digest)
                 else:
                     LOG.info("job=%s duplicate_suppressed=true", existing["id"])
             except (OSError, UnsafeInput) as error:
+                hint = "fix storage and retry-input"
+                if operation == "seal_archive" and getattr(error, "errno", None) in {
+                    errno.EINVAL,
+                    errno.ENOTSUP,
+                    errno.ENOSYS,
+                }:
+                    hint = (
+                        "check archive exclusive-rename support; use physical local archive "
+                        "storage, then retry-input"
+                    )
                 reason = (
                     str(error)
                     if isinstance(error, UnsafeInput)
-                    else (f"claim I/O failure errno={error.errno}; fix storage and retry-input")
+                    else f"claim I/O failure operation={operation} errno={error.errno}; {hint}"
                 )
                 identifier = hashlib.sha256((path.name + signature).encode()).hexdigest()
                 atomic_json(
@@ -169,6 +189,7 @@ class Worker:
                         "source_name": path.name,
                         "signature": signature,
                         "reason": reason,
+                        "operation": operation,
                         "original_retained_in_inbox": True,
                     },
                 )

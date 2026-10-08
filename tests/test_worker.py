@@ -251,6 +251,39 @@ def test_claim_permissions_failure_is_retained_and_reviewed(config, ledger, monk
     worker.scan()
     assert source.exists()
     assert len(list(config.review.iterdir())) == 1
+    report = json.loads(next(config.review.iterdir()).read_text())
+    assert report["operation"] == "copy_to_work"
+    assert "operation=copy_to_work" in report["reason"]
+
+
+def test_unsupported_archive_rename_is_diagnosed_and_retryable(config, ledger, monkeypatch):
+    source = config.inbox / "source.pdf"
+    text_pdf(source)
+    digest = sha256(source)
+    worker = Worker(config, ledger, FakeAnalyzer(config))
+
+    def unsupported(*_):
+        raise OSError(errno.EINVAL, "synthetic unsupported rename flag")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("doc_splitter.worker.rename_noreplace", unsupported)
+        worker.scan()
+    report = json.loads(next(config.review.iterdir()).read_text())
+    assert report["operation"] == "seal_archive"
+    assert "errno=22" in report["reason"]
+    assert "archive exclusive-rename support" in report["reason"]
+    assert sha256(source) == digest
+    assert (config.archive / digest / "source.pending").exists()
+    assert not (config.archive / digest / "source.pdf").exists()
+    assert ledger.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+    assert not list(config.consume.iterdir())
+    # retry-input removes the observation after the storage configuration is fixed.
+    with ledger.db:
+        ledger.db.execute("DELETE FROM observations WHERE name=?", (source.name,))
+    worker.cycle()
+    assert ledger.job(digest)["status"] == "completed"
+    assert sha256(config.archive / digest / "source.pdf") == digest
+    assert not (config.archive / digest / "source.pending").exists()
 
 
 def test_interrupted_analysis_restarts_before_any_publication(config, ledger):

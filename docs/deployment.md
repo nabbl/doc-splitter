@@ -24,7 +24,7 @@ must not be described as live until that verification is complete.
 The existing consume mapping uses Unraid user-share FUSE semantics. Its correct
 narrow physical backing directory has not been established; do not guess a safe
 parent bind from a shared pathname prefix.
-The application fails closed for FUSE handoff/state. Operator must first identify
+The application fails closed for FUSE handoff/state/archive. Operator must first identify
 the actual physical local pool/filesystem and explicitly approve a dedicated narrow
 handoff layout. Do not automatically move existing documents or change Paperless.
 
