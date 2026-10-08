@@ -71,11 +71,13 @@ budgets are examples (4 GiB/two CPUs), not production capacity measurements.
 
 ## Rollback
 
-The startup-retry release upgrades the ledger to schema 2, preserving existing
+The inbox-cleanup release upgrades the ledger to schema 3, preserving existing
 jobs and output progress. Back up state while stopped before upgrading. Older
-schema-1 images cannot open the upgraded ledger; choose a schema-compatible
+schema-1/2 images cannot open the upgraded ledger; choose a schema-compatible
 rollback image. Never restore a pre-upgrade ledger over newer deliveries without
-reconciling consumer history.
+reconciling consumer history. Preserve any recorded `.doc-splitter-cleanup-*`
+directories inside the inbox: they can contain a detached source awaiting cleanup
+or operator review. Turning cleanup off retains those files rather than deleting them.
 
 Stop only the preprocessor through Arcane. Revert its GitOps image/config commit
 to the previously verified image (or leave this newly added service stopped).

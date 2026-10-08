@@ -14,14 +14,47 @@ from .fs import UnsafeInput, sha256, sync_dir
 from .model import Model, page_ranges
 
 
-def validate_ranges(ranges: list, count: int) -> None:
-    expected = 1
+def validate_ranges(ranges: list, count: int, blank_pages=()) -> None:
+    if type(count) is not int or count <= 0:
+        raise UnsafeInput("page count must be positive")
+    if list(blank_pages) != sorted(set(blank_pages)) or any(
+        type(page) is not int or page < 1 or page > count for page in blank_pages
+    ):
+        raise UnsafeInput("invalid blank-page mapping")
+    omitted = set(blank_pages)
+    expected = [page for page in range(1, count + 1) if page not in omitted]
+    covered = []
+    prior_end = 0
     for start, end in ranges:
-        if start != expected or end < start or end > count:
-            raise UnsafeInput("ranges are not a contiguous, non-overlapping page partition")
-        expected = end + 1
-    if expected != count + 1 or not ranges:
-        raise UnsafeInput("ranges do not cover every page")
+        if start <= prior_end or end < start or end > count or start in omitted or end in omitted:
+            raise UnsafeInput("ranges are not an ordered, non-overlapping page partition")
+        covered.extend(page for page in range(start, end + 1) if page not in omitted)
+        prior_end = end
+    if covered != expected:
+        raise UnsafeInput("ranges do not cover every retained page")
+
+
+def blank_only(proposal: dict) -> bool:
+    count = proposal["page_count"]
+    return (
+        count > 0
+        and proposal.get("blank_pages") == list(range(1, count + 1))
+        and not proposal["ranges"]
+        and not proposal["outputs"]
+    )
+
+
+def is_blank_page(image, text: str) -> bool:
+    if text.strip():
+        return False
+    with image.convert("L") as gray:
+        pixels = np.asarray(gray)
+        background = float(np.median(pixels))
+        # Require near-white paper with at most 0.001% darker pixels (isolated scanner specks).
+        # Do not crop borders or erase faint strokes by denoising; uncertainty keeps the page.
+        return background >= 230 and np.count_nonzero(pixels < background - 4) <= (
+            pixels.size * 0.00001
+        )
 
 
 def check_ocr(config: Config) -> None:
@@ -83,9 +116,11 @@ def text_or_ocr(page, image, config: Config) -> str:
     return result.stdout
 
 
-def export_range(source, start: int, end: int, destination: Path) -> None:
+def export_range(source, start: int, end: int, destination: Path, blank_pages=()) -> None:
     with pikepdf.Pdf.new() as output:
-        output.pages.extend(source.pages[start - 1 : end])
+        output.pages.extend(
+            source.pages[page - 1] for page in range(start, end + 1) if page not in blank_pages
+        )
         output.save(destination, deterministic_id=True)
     destination.chmod(0o640)
     with destination.open("rb") as stream:
@@ -93,12 +128,15 @@ def export_range(source, start: int, end: int, destination: Path) -> None:
     sync_dir(destination.parent)
 
 
-def validate_export(source_path: Path, output_path: Path, start: int, end: int) -> None:
+def validate_export(
+    source_path: Path, output_path: Path, start: int, end: int, blank_pages=()
+) -> None:
+    pages = [page for page in range(start, end + 1) if page not in blank_pages]
     with pikepdf.open(source_path) as source, pikepdf.open(output_path) as output:
-        if len(output.pages) != end - start + 1 or output.check_pdf_syntax():
+        if len(output.pages) != len(pages) or output.check_pdf_syntax():
             raise UnsafeInput("export page count or syntax mismatch")
         for index, exported in enumerate(output.pages):
-            original = source.pages[start - 1 + index]
+            original = source.pages[pages[index] - 1]
             if (
                 list(exported.mediabox) != list(original.mediabox)
                 or list(exported.cropbox) != list(original.cropbox)
@@ -110,7 +148,7 @@ def validate_export(source_path: Path, output_path: Path, start: int, end: int) 
         closing(pdfium.PdfDocument(output_path)) as output,
     ):
         for index in range(len(output)):
-            with closing(source[start - 1 + index]) as a, closing(output[index]) as b:
+            with closing(source[pages[index] - 1]) as a, closing(output[index]) as b:
                 with closing(a.render(scale=1)) as ra, closing(b.render(scale=1)) as rb:
                     if not np.array_equal(ra.to_numpy(), rb.to_numpy()):
                         raise UnsafeInput("export visual comparison failed")
@@ -118,31 +156,47 @@ def validate_export(source_path: Path, output_path: Path, start: int, end: int) 
 
 def prepare(config: Config, model: Model, source: Path, job_id: str) -> dict:
     embeddings = []
+    retained_pages, blank_pages = [], []
     with open_pdf(source, config.max_pages) as original:
         count = len(original.pages)
         with closing(pdfium.PdfDocument(source)) as document:
             if len(document) != count:
                 raise UnsafeInput("PDF parsers disagree about page count")
             for offset in range(0, count, config.batch_size):
-                images, texts = [], []
+                images, texts, rendered = [], [], []
                 try:
                     for index in range(offset, min(count, offset + config.batch_size)):
                         with closing(document[index]) as page:
                             image = render(page, config)
+                            rendered.append(image)
+                            text = text_or_ocr(page, image, config)
+                            if config.remove_blank_pages and is_blank_page(image, text):
+                                blank_pages.append(index + 1)
+                                continue
+                            retained_pages.append(index + 1)
                             images.append(image)
-                            texts.append(text_or_ocr(page, image, config))
-                    embeddings.append(model.encode(images, texts))
+                            texts.append(text)
+                    if images:
+                        embeddings.append(model.encode(images, texts))
                 finally:
-                    for image in images:
+                    for image in rendered:
                         image.close()
-        scores = model.boundaries(embeddings)
-        if len(scores) != count:
-            raise UnsafeInput("inference did not return every page")
-        ranges = page_ranges(scores, config.threshold)
-        validate_ranges(ranges, count)
+        scores = model.boundaries(embeddings) if retained_pages else np.array([])
+        if len(scores) != len(retained_pages):
+            raise UnsafeInput("inference did not return every retained page")
+        filtered_ranges = page_ranges(scores, config.threshold) if retained_pages else []
+        ranges = [
+            (retained_pages[start - 1], retained_pages[end - 1]) for start, end in filtered_ranges
+        ]
+        validate_ranges(ranges, count, blank_pages)
+        source_scores = [None] * count
+        for page, score in zip(retained_pages, scores.tolist(), strict=True):
+            source_scores[page - 1] = score
         proposed = {
             "page_count": count,
-            "scores": scores.tolist(),
+            "retained_pages": retained_pages,
+            "blank_pages": blank_pages,
+            "scores": source_scores,
             "ranges": ranges,
             "outputs": [],
             "review_required": bool(
@@ -159,13 +213,16 @@ def prepare(config: Config, model: Model, source: Path, job_id: str) -> dict:
             stage = config.staging / name
             if stage.exists() or stage.is_symlink():
                 raise UnsafeInput("unexpected preexisting stage output")
-            export_range(original, start, end, stage)
-            validate_export(source, stage, start, end)
+            export_range(original, start, end, stage, blank_pages)
+            validate_export(source, stage, start, end, blank_pages)
             proposed["outputs"].append(
                 {
                     "name": name,
                     "start": start,
                     "end": end,
+                    "source_pages": [
+                        page for page in range(start, end + 1) if page not in blank_pages
+                    ],
                     "sha256": sha256(stage),
                 }
             )

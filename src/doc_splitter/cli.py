@@ -79,7 +79,7 @@ def reprocess(config, ledger, source_hash):
     if prior is None or prior["status"] not in {"completed", "review", "dry_run"}:
         raise ValueError("source must have a terminal job before administrative reprocessing")
     source = config.inbox / prior["source_name"]
-    if sha256(source) != source_hash:
+    if not source.exists() or sha256(source) != source_hash:
         raise ValueError(
             "restore the exact source PDF to its recorded inbox name before reprocessing"
         )
@@ -104,6 +104,9 @@ def reprocess(config, ledger, source_hash):
         )
         ledger.event(
             job_id, "administrative_reprocess", "operator accepted duplicate-ingestion risk"
+        )
+        ledger.register_input(
+            prior["source_name"], json.dumps(fingerprint(source.lstat())), source_hash
         )
     Worker(config, ledger, None).write_manifest(job_id)
     print(job_id)

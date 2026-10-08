@@ -7,6 +7,7 @@ import stat
 import time
 import uuid
 
+from .cleanup import InputCleanup
 from .config import Config
 from .fs import (
     AmbiguousDelivery,
@@ -20,7 +21,7 @@ from .fs import (
     sync_dir,
 )
 from .ledger import Ledger
-from .pdf import validate_ranges
+from .pdf import blank_only, validate_ranges
 
 LOG = logging.getLogger(__name__)
 TERMINAL = ("completed", "review", "dry_run")
@@ -32,6 +33,7 @@ class Worker:
         self.ledger = ledger
         self.analyzer = analyzer
         self.stopped = stopped
+        self.input_cleanup = InputCleanup(config, ledger)
 
     def source(self, job):
         return self.config.archive / job["source_hash"] / "source.pdf"
@@ -172,6 +174,7 @@ class Worker:
                         "UPDATE observations SET handled=1 WHERE name=? AND signature=?",
                         (path.name, signature),
                     )
+                    self.ledger.register_input(path.name, json.dumps(copied_signature), digest)
                     if attempts > 1:
                         self.ledger.event(identifier, "claim_recovered", digest)
                 claim_committed = True
@@ -342,6 +345,11 @@ class Worker:
             "SELECT id FROM jobs WHERE status IN ('completed','review','dry_run')"
         ).fetchall():
             self.write_manifest(job["id"])
+        self.cleanup_completed_inputs()
+
+    def cleanup_completed_inputs(self):
+        for job_id in self.input_cleanup.run():
+            self.write_manifest(job_id)
 
     def record_published(self, job_id, name):
         with self.ledger.db:
@@ -354,7 +362,11 @@ class Worker:
         job = self.ledger.job(job_id)
         outputs = self.ledger.outputs(job_id)
         proposal = json.loads(job["proposal"])
-        validate_ranges([(o["start"], o["end"]) for o in outputs], proposal["page_count"])
+        validate_ranges(
+            [(o["start"], o["end"]) for o in outputs],
+            proposal["page_count"],
+            proposal.get("blank_pages", []),
+        )
         if all(output["status"] == "published" for output in outputs):
             self.ledger.transition(job_id, "completed")
             self.write_manifest(job_id)
@@ -367,7 +379,7 @@ class Worker:
                 continue
             if output["status"] != "ready":
                 raise AmbiguousDelivery("unreconciled publication intent")
-            # Check source mutation between parts; never remove the inbox file in v1.
+            # Keep the source intact until every output has a durable acknowledgment.
             path = self.config.inbox / job["source_name"]
             if fingerprint(path.lstat()) != tuple(json.loads(job["source_signature"])):
                 raise UnsafeInput("inbox source changed during publication")
@@ -420,13 +432,17 @@ class Worker:
                     )
                     self.ledger.event(job_id, "preparing")
                 proposal = self.analyzer.analyze(self.source(job), job_id)
-                validate_ranges(proposal["ranges"], proposal["page_count"])
+                validate_ranges(
+                    proposal["ranges"], proposal["page_count"], proposal.get("blank_pages", [])
+                )
                 self.source_unchanged(job)
                 status = (
                     "dry_run"
                     if self.config.dry_run
                     else "review"
                     if proposal["review_required"]
+                    else "completed"
+                    if blank_only(proposal)
                     else "prepared"
                 )
                 with self.ledger.db:
@@ -447,11 +463,14 @@ class Worker:
                             ),
                         )
                     self.ledger.event(job_id, status)
+                    if blank_only(proposal):
+                        self.ledger.event(job_id, "blank_only", "no nonblank pages to publish")
                 self.write_manifest(job_id)
                 LOG.info(
-                    "job=%s pages=%s ranges=%s transition=%s analysis_seconds=%.3f",
+                    "job=%s pages=%s blank_pages=%s ranges=%s transition=%s analysis_seconds=%.3f",
                     job_id,
                     proposal["page_count"],
+                    proposal.get("blank_pages", []),
                     proposal["ranges"],
                     status,
                     time.monotonic() - started,
@@ -497,3 +516,5 @@ class Worker:
             if self.stopped():
                 break
             self.process(job["id"])
+        if not self.stopped():
+            self.cleanup_completed_inputs()

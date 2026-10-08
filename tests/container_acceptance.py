@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
-from tests.fixtures import image_pdf, merged_pdf, text_pdf
+from tests.fixtures import duplex_pdf, image_pdf, merged_pdf, text_pdf
 
 ROOTS = ("inbox", "consume", "staging", "archive", "review", "work", "state", "model_cache")
 
@@ -64,6 +64,8 @@ def main():
             text_pdf(fixtures / "SYNTHETIC-128-pages.pdf", 128)
             text_pdf(fixtures / "SYNTHETIC-129-rejected.pdf", 129)
             image_pdf(fixtures / "SYNTHETIC-scan.pdf")
+            duplex_pdf(fixtures / "SYNTHETIC-duplex.pdf")
+            duplex_pdf(fixtures / "SYNTHETIC-blank-only.pdf", all_blank=True)
             init = (
                 "import pathlib,os,shutil; r=pathlib.Path('/acceptance'); "
                 f"[(r/p).mkdir(exist_ok=True) for p in {ROOTS!r}]; "
@@ -145,6 +147,8 @@ def main():
             f"{volume}:/acceptance",
             "-e",
             "SPLIT_COMPLETION_MODE=atomic",
+            "-e",
+            "SPLIT_REMOVE_BLANK_PAGES=true",
         ]
         for root in ROOTS:
             options.extend(["-e", f"SPLIT_{root.upper()}=/acceptance/{root}"])
@@ -162,23 +166,24 @@ def main():
             lambda: query(name, "SELECT count(*) FROM jobs WHERE status IN ('completed','review')")[
                 0
             ][0]
-            == 6,
+            == 8,
             timeout=1800,
         )
         elapsed = time.monotonic() - started
         rows = query(
             name, "SELECT source_name,status,proposal,error FROM jobs ORDER BY source_name"
         )
-        assert sum(row[1] == "completed" for row in rows) == 5, rows
+        assert sum(row[1] == "completed" for row in rows) == 7, rows
         assert sum(row[1] == "review" for row in rows) == 1, rows
         assert query(
             name, "SELECT attempts FROM observations WHERE name='SYNTHETIC-single.pdf'"
         ) == [[2]]
-        assert query(name, "PRAGMA user_version") == [[2]]
+        assert query(name, "PRAGMA user_version") == [[3]]
         for source, status, proposal, error in rows:
             if "129" in source:
                 assert status == "review" and "128" in error
             else:
+                proposal = json.loads(proposal)
                 expected = (
                     128
                     if "128" in source
@@ -186,9 +191,17 @@ def main():
                     if "41" in source
                     else 4
                     if "multi" in source
+                    else 5
+                    if "duplex" in source or "blank-only" in source
                     else 1
                 )
-                assert json.loads(proposal)["page_count"] == expected
+                assert proposal["page_count"] == expected
+                if "blank-only" in source:
+                    assert proposal["blank_pages"] == [1, 2, 3, 4, 5]
+                    assert not proposal["outputs"] and not proposal["ranges"]
+                if "duplex" in source:
+                    assert proposal["blank_pages"] == [1, 3, 5]
+                    assert [p for o in proposal["outputs"] for p in o["source_pages"]] == [2, 4]
         stats = json.loads(docker("stats", "--no-stream", "--format", "{{json .}}", name))
         resource_stats = docker(
             "exec",
@@ -212,13 +225,41 @@ def main():
         docker("stop", "--time", "30", name)
         docker("rm", name)
         created = False
-        # Restart the same warmed volumes without any network; consumed files stay absent.
-        docker("run", "-d", *options, "--network", "none", args.image)
+        # Enabling cleanup must handle prior completions even after the consumer took outputs.
+        docker(
+            "run",
+            "-d",
+            *options,
+            "--network",
+            "none",
+            "-e",
+            "SPLIT_DELETE_COMPLETED_INPUTS=true",
+            args.image,
+        )
         created = True
         await_condition(
             name, lambda: inspect(name)["State"].get("Health", {}).get("Status") == "healthy"
         )
         assert query(name, "SELECT job_id,name,status FROM outputs ORDER BY name") == before
+        assert query(name, "SELECT count(*) FROM input_cleanups WHERE status='done'") == [[7]]
+        assert (
+            docker(
+                "exec",
+                name,
+                "python",
+                "-c",
+                "from pathlib import Path; import hashlib,sqlite3; "
+                "r=Path('/acceptance'); c=sqlite3.connect(r/'state/jobs.sqlite3'); "
+                "assert sorted(p.name for p in (r/'inbox').iterdir())"
+                "==['SYNTHETIC-129-rejected.pdf']; "
+                "rows=c.execute(\"SELECT source_hash FROM jobs WHERE status='completed'\")"
+                ".fetchall(); "
+                "assert all(hashlib.sha256((r/'archive'/h/'source.pdf').read_bytes())"
+                ".hexdigest()==h "
+                "for (h,) in rows); print('completed inbox copies removed; all archives retained')",
+            )
+            == "completed inbox copies removed; all archives retained"
+        )
         assert (
             docker(
                 "exec",
@@ -235,8 +276,12 @@ def main():
             name,
             "python",
             "-c",
-            "import pathlib; p=pathlib.Path('/acceptance/inbox/SYNTHETIC-41-pages.pdf'); "
-            "q=p.with_name('SYNTHETIC-restart.pdf'); "
+            "import pathlib,sqlite3; r=pathlib.Path('/acceptance'); "
+            "c=sqlite3.connect(r/'state/jobs.sqlite3'); "
+            'h=c.execute("SELECT source_hash FROM jobs '
+            "WHERE source_name='SYNTHETIC-41-pages.pdf'\")"
+            ".fetchone()[0]; p=r/'archive'/h/'source.pdf'; "
+            "q=r/'inbox/SYNTHETIC-restart.pdf'; "
             "q.write_bytes(p.read_bytes()+b'\\n% restart test\\n')",
         )
         await_condition(
@@ -263,13 +308,18 @@ def main():
         docker("start", name)
         await_condition(
             name,
-            lambda: query(name, "SELECT count(*) FROM jobs WHERE status='completed'")[0][0] == 6,
+            lambda: query(name, "SELECT count(*) FROM jobs WHERE status='completed'")[0][0] == 8,
             timeout=1800,
         )
         attempts = query(
             name, "SELECT attempts FROM jobs WHERE source_name='SYNTHETIC-restart.pdf'"
         )[0][0]
         assert attempts == 2, attempts
+        await_condition(
+            name,
+            lambda: query(name, "SELECT count(*) FROM input_cleanups WHERE status='done'")[0][0]
+            == 8,
+        )
         report = {
             "image": inspect(name)["Image"],
             "model_cache": "prepopulated" if args.cache else "cold automated download",
@@ -280,6 +330,10 @@ def main():
             "fixtures": [(row[0], row[1]) for row in rows],
             "offline_restart": "passed",
             "existing_v1_failed_input_retried_on_startup": True,
+            "completed_inputs_removed_with_archives_retained": True,
+            "reviewed_input_retained": True,
+            "blank_duplex_pages_omitted": True,
+            "all_blank_archived_without_handoff": True,
             "consumed_outputs_not_regenerated": True,
             "forced_inference_termination_resumed_attempts": attempts,
             "logs": docker("logs", name),

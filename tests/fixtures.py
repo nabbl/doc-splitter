@@ -39,6 +39,24 @@ def image_pdf(path: Path):
     image.close()
 
 
+def duplex_pdf(path: Path, all_blank=False):
+    blank = path.with_suffix(".blank.pdf")
+    text = path.with_suffix(".text.pdf")
+    with Image.new("RGB", (900, 1200), (248, 248, 248)) as image:
+        image.save(blank, "PDF", resolution=150)
+    text_pdf(text, 2, label="SYNTHETIC DUPLEX", rotate=True)
+    try:
+        with pikepdf.Pdf.new() as result, pikepdf.open(blank) as back, pikepdf.open(text) as front:
+            for index in range(5):
+                result.pages.append(
+                    back.pages[0] if all_blank or index % 2 == 0 else front.pages[index // 2]
+                )
+            result.save(path, deterministic_id=True)
+    finally:
+        blank.unlink()
+        text.unlink()
+
+
 def merged_pdf(path: Path):
     first = path.with_suffix(".invoice.pdf")
     second = path.with_suffix(".letter.pdf")

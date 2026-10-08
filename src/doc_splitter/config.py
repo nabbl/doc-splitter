@@ -38,6 +38,8 @@ class Config:
     heartbeat_timeout: int = 60
     startup_timeout: int = 1800
     dry_run: bool = False
+    delete_completed_inputs: bool = False
+    remove_blank_pages: bool = False
     review_margin: float = 0.0
     image_revision: str = "development"
 
@@ -127,6 +129,9 @@ class Config:
         }
 
     def revision(self) -> str:
-        return hashlib.sha256(
-            json.dumps(self.manifest_config(), sort_keys=True).encode()
-        ).hexdigest()
+        values = self.manifest_config()
+        # Inbox retention is operational and must not change boundary decisions.
+        values.pop("delete_completed_inputs")
+        if not values["remove_blank_pages"]:
+            values.pop("remove_blank_pages")
+        return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()

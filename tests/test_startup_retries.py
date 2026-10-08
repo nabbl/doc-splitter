@@ -24,7 +24,7 @@ def test_upgrade_retries_existing_v1_claim_failure_without_touching_input(config
     report = legacy_failed_claim(database, source, config.review)
     ledger = Ledger(database)
     try:
-        assert ledger.db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert ledger.db.execute("PRAGMA user_version").fetchone()[0] == 3
         worker = Worker(config, ledger, FakeAnalyzer(config))
         worker.recover()
         assert observation(ledger, source.name)["handled"] == 0
@@ -233,7 +233,7 @@ def test_upgrade_preserves_terminal_jobs_and_output_history(config, monkeypatch,
         assert upgraded.manifest(job_id) == before
         assert not list(config.consume.iterdir())
         assert analyzer.calls == 0
-        assert upgraded.db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert upgraded.db.execute("PRAGMA user_version").fetchone()[0] == 3
     finally:
         upgraded.close()
 

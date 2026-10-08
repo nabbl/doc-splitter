@@ -120,6 +120,8 @@ def verify_layout(config) -> None:
         raise ValueError("staging and consume must share a filesystem")
     if not os.access(config.consume, os.W_OK | os.X_OK):
         raise ValueError("consume is not writable by the runtime UID/GID")
+    if config.delete_completed_inputs and not os.access(config.inbox, os.W_OK | os.X_OK):
+        raise ValueError("inbox must be writable when completed-input cleanup is enabled")
     for name in ("archive", "review", "staging", "work", "state", "model_cache"):
         root = getattr(config, name)
         if not os.access(root, os.W_OK | os.X_OK):

@@ -63,6 +63,7 @@ variables; the CLI does not implicitly load a `.env` file.
 | `SPLIT_INBOX`, `CONSUME`, `STAGING`, `ARCHIVE`, `REVIEW`, `WORK`, `STATE`, `MODEL_CACHE` | Eight absolute, pre-created, non-overlapping roots; prefix every name with `SPLIT_` |
 | `SPLIT_MODEL_REVISION` | The audited commit above; other values fail until hashes/code are reviewed |
 | `SPLIT_THRESHOLD`, `REVIEW_MARGIN`, `DRY_RUN` | `0.5`, `0`, `false` |
+| `SPLIT_DELETE_COMPLETED_INPUTS`, `REMOVE_BLANK_PAGES` | Both `false`; explicit opt-ins described below |
 | `SPLIT_POLL_SECONDS`, `SETTLE_SECONDS`, `COMPLETION_MODE` | `5`, `30`, `settle` |
 | `SPLIT_OCR_LANGUAGES`, `OCR_TIMEOUT` | `deu+eng`, 120 seconds per page |
 | `SPLIT_BATCH_SIZE`, `THREADS` | 2 pages, 2 CPU inference/OCR threads |
@@ -111,9 +112,9 @@ prove upload completion. Never keep writing after the final rename/marker.
 Before claim, regular-file/readability checks reject symlinks, directories and
 unsupported extensions. Copying checks descriptor/path identity, timestamps and
 size, then SHA-256 verifies the retained source before publishing. Subsequent source
-mutation quarantines the job. **V1 never deletes or moves inbox originals**, avoiding
-the pathname race between identity verification and unlink. Retention is deliberate:
-plan archive/inbox disk capacity and operator backups; there is no automatic purge.
+mutation quarantines the job. Inbox originals are retained by default. Enable
+`SPLIT_DELETE_COMPLETED_INPUTS=true` to remove successfully delivered inbox copies;
+the immutable archived original and deduplication history are always retained.
 
 Sources are identified by SHA-256. Different filenames with the same bytes are
 suppressed durably, even if Paperless has already removed every output.
@@ -122,12 +123,54 @@ page scores/ranges, model/config/image revisions, output hashes, progress and au
 events. Review contains JSON records referencing that archive or, for pre-claim
 errors, the untouched inbox file. **No failed PDF is sent to Paperless.**
 
-PDF exports use pikepdf page copying, not image reconstruction. Every range is
-contiguous/non-overlapping and covers every original page once. Each output is
+PDF exports use pikepdf page copying, not image reconstruction. Ordered,
+non-overlapping ranges cover every retained page exactly once. Each output is
 reopened, page count/geometry checked and rendered page-by-page against the original
 before any publication begins. One-document results are valid and publish one PDF.
 PDF forms/annotations whose exported appearance differs are quarantined rather
 than silently losing visible content.
+
+## Blank duplex pages and inbox cleanup
+
+`SPLIT_REMOVE_BLANK_PAGES=true` filters confidently blank pages **before** boundary
+inference, so a blank duplex back cannot become a standalone document. Both
+embedded text/local OCR and the rendered image are checked: any recognized text
+keeps a page, as do dark backgrounds, meaningful marks, faint strokes or borders.
+Near-white paper with no text and at most 0.001% pixels more than four gray levels
+darker than its median background is considered blank. There is no edge cropping
+or destructive denoising. This deliberately conservative heuristic can retain
+shadowed/noisy backs; inspect representative scans before relying on it.
+
+Manifests record `blank_pages`, `retained_pages`, original-page `ranges`, each
+output's `source_pages`, and `null` scores for excluded pages. For example, a
+range `(2, 4)` with page 3 blank exports original pages 2 and 4, unchanged. Page
+limits still apply to the entire input before filtering. An all-blank scan is
+marked completed with a `blank_only` audit event and no output files.
+
+With `SPLIT_DELETE_COMPLETED_INPUTS=true`, completed inbox copies (including prior
+completed jobs found on startup and newly claimed duplicates) are removed after
+**every** output has a durable publication acknowledgment. All-blank scans are
+also removed after archiving, without sending anything to Paperless. Cleanup does
+not wait for Paperless ingestion or use consume-file presence as delivery proof.
+Dry-run mode, review jobs, failed/partial/ambiguous publication and active
+reprocessing preserve their inbox inputs. Neither enabling cleanup nor blank
+filtering reprocesses completed jobs or removes previously ingested Paperless documents.
+
+Cleanup verifies the archive and the exact input identity/hash, records a private
+temporary directory beneath the inbox, then detaches the source there and
+re-verifies it before deletion. It never unlinks a reused public inbox filename.
+This separate inbox operation uses a normal rename within its filesystem;
+archive/handoff exclusive-rename requirements are unchanged. The runtime needs
+write/execute access to the inbox. Crashes resume the recorded cleanup on startup.
+Do not remove `.doc-splitter-cleanup-*` directories manually: an unexpectedly
+changed file may be retained there for recovery. `review/cleanup-*.json` records
+the location/reason; cleanup errors never roll back successful delivery. I/O
+failures retry once on the next restart, not on every poll. Completion `.done`
+markers are not deleted; the scanner must remove stale markers before name reuse.
+
+There is no archive purge. To administratively reprocess a cleaned-up source,
+restore a **copy** of its archived `source.pdf` to its recorded inbox name first,
+then explicitly accept duplicate-ingestion risk with `reprocess`.
 
 ## Durable publication and recovery
 
@@ -174,8 +217,8 @@ Already claimed batches, completed outputs, deliberate review/dry-run decisions,
 permanent input failures and ambiguous deliveries are **not** automatically
 reprocessed. Existing schema-v1 `claim I/O failure` review records are recognized
 on upgrade, so scans rejected by older images are retried too. Keep both the state
-and review directories during the upgrade. The ledger migrates to schema 2 in
-place, preserving jobs/hashes/output progress; older schema-1 images cannot open
+and review directories during the upgrade. The current ledger migrates to schema 3 in
+place, preserving jobs/hashes/output progress; older schema-1/2 images cannot open
 the upgraded database. Back up the stopped state directory before upgrading and
 do not restore a stale backup after new deliveries without reconciling them.
 
@@ -220,6 +263,9 @@ downloads the real model, checks German/English OCR, processes 1/4/41/128 pages,
 rejects 129 pages, simulates consumer removal, restarts with `--network none`, and
 kills/restarts the actual worker during inference. It also starts from a schema-v1
 failed inbox claim and verifies automatic migration/retry of the untouched PDF.
+Duplex/all-blank fixtures verify blank filtering, archive retention and no empty
+handoff. Enabling cleanup on restart removes previous completed inbox copies
+without regenerating consumer-removed outputs.
 It removes only its own test
 container/volume afterward. Fixtures are explicitly synthetic and non-sensitive.
 

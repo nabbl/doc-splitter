@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS events (
     event TEXT NOT NULL,
     detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS input_cleanups (
+    source_name TEXT NOT NULL,
+    source_signature TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    directory TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(source_name, source_signature)
+);
 """
 
 
@@ -58,7 +66,7 @@ class Ledger:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2):
+        if version not in (0, 1, 2, 3):
             raise ValueError("unsupported ledger schema; restore matching application image")
         self.db.executescript(SCHEMA)
         with self.db:
@@ -68,7 +76,11 @@ class Ledger:
                     self.db.execute(
                         f"ALTER TABLE observations ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
                     )
-            self.db.execute("PRAGMA user_version=2")
+            self.db.execute(
+                "INSERT OR IGNORE INTO input_cleanups(source_name,source_signature,source_hash) "
+                "SELECT source_name,source_signature,source_hash FROM jobs"
+            )
+            self.db.execute("PRAGMA user_version=3")
 
     def close(self):
         self.db.close()
@@ -88,6 +100,13 @@ class Ledger:
         self.db.execute(
             "INSERT INTO events(job_id,time,event,detail) VALUES(?,?,?,?)",
             (job_id, time.time(), event, detail),
+        )
+
+    def register_input(self, name: str, signature: str, source_hash: str):
+        self.db.execute(
+            "INSERT OR IGNORE INTO input_cleanups(source_name,source_signature,source_hash) "
+            "VALUES(?,?,?)",
+            (name, signature, source_hash),
         )
 
     def transition(self, job_id: str, status: str, error: str | None = None):
